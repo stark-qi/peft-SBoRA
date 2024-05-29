@@ -11,20 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Optional, Union
-
+from typing import Any, List, Optional, Union
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import svd_lowrank
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
+from peft.utils.integrations import dequantize_bnb_weight, gather_params_ctx
 from peft.utils.other import transpose
 
 from .config import LoraConfig
@@ -43,6 +41,7 @@ class LoraLayer(BaseTunerLayer):
         self.scaling = {}
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
+        #self.lora_A = nn.ParameterDict({})
         self.lora_B = nn.ModuleDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
@@ -56,6 +55,7 @@ class LoraLayer(BaseTunerLayer):
         self.kwargs = kwargs
 
         base_layer = self.get_base_layer()
+        #peft 中创建的lora_a和lora_b使用了字典方式，里面包含了所有会嵌入lora的层，对于不同的层，我们拥有不同的初始化方式
         if isinstance(base_layer, nn.Linear):
             in_features, out_features = base_layer.in_features, base_layer.out_features
         elif isinstance(base_layer, nn.Conv2d):
@@ -77,12 +77,6 @@ class LoraLayer(BaseTunerLayer):
             in_features, out_features = base_layer.in_features, base_layer.out_features
         elif hasattr(base_layer, "w_bit") and base_layer.__class__.__name__ == "WQLinear_GEMM":
             # Awq layers
-            in_features, out_features = base_layer.in_features, base_layer.out_features
-        elif base_layer.__class__.__name__ == "EetqLinear":
-            # Eetq layers
-            in_features, out_features = base_layer.in_features, base_layer.out_features
-        elif hasattr(base_layer, "W_q") and base_layer.__class__.__name__ == "HQQLinear":
-            # HQQ layers
             in_features, out_features = base_layer.in_features, base_layer.out_features
         else:
             raise ValueError(f"Unsupported layer type {type(base_layer)}")
@@ -106,22 +100,42 @@ class LoraLayer(BaseTunerLayer):
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
+
+        # #A矩阵的第一次初始化
+        # #self.lora_A[adapter_name] = nn.Parameter(torch.randn(8))
+        # self.lora_A[adapter_name] = nn.Linear(1, r, bias=False)
+        # # self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+        # self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+       
+
+
+        # SBLora-B的初始化
+        #self.lora_A[adapter_name] = nn.Parameter(torch.randn(8))
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
-        self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        #self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        self.lora_B[adapter_name] = nn.Linear(1, r, bias=False)
+
+
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
 
-        if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
-            self.pissa_init(adapter_name, init_lora_weights)
-        elif init_lora_weights == "loftq":
+        if init_lora_weights == "loftq":
             self.loftq_init(adapter_name)
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        # call this before dora_init
-        self._move_adapter_to_device_of_base_layer(adapter_name)
+        # check weight and qweight (for GPTQ)
+        for weight_name in ("weight", "qweight"):
+            weight = getattr(self.get_base_layer(), weight_name, None)
+            if weight is not None:
+                # the layer is already completely initialized, this is an update
+                if weight.dtype.is_floating_point or weight.dtype.is_complex:
+                    self.to(weight.device, dtype=weight.dtype)
+                else:
+                    self.to(weight.device)
+                break
 
         if use_dora:
             self.dora_init(adapter_name)
@@ -137,54 +151,46 @@ class LoraLayer(BaseTunerLayer):
 
         if adapter_name in self.lora_A.keys():
             if init_lora_weights is True:
-                # initialize A the same way as the default for nn.Linear and B to zero
+                #initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                # nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                
+                #新的初始化方式
+                # base_layer = self.get_base_layer()
+                # dim, output_dim = base_layer.weight.T.shape
+                # r, output_dim = self.lora_B[adapter_name].weight.T.shape
+                # #self.lora_A[adapter_name].weight = nn.Parameter(torch.tensor([(distance*i) for i in range(r)],dtype = float))
+                # # 生成一个有序的整数序列
+                # ordered_indices = torch.arange(output_dim,dtype = float)
+                # # 对序列进行随机洗牌
+                # shuffled_indices = torch.randperm(output_dim)
+
+                # # 根据洗牌后的索引获取不重复的随机整数
+                # self.lora_A[adapter_name].weight = nn.Parameter(ordered_indices[shuffled_indices[0:r]])
+
+                #SBLora-B的初始化
+                base_layer = self.get_base_layer()
+                dim, output_dim = base_layer.weight.T.shape
+                inputdim, r = self.lora_A[adapter_name].weight.T.shape
+                #distance = dim//r
+                #self.lora_A[adapter_name].weight = nn.Parameter(torch.tensor([(distance*i) for i in range(r)],dtype = float))
+                # 生成一个有序的整数序列
+                ordered_indices = torch.arange(output_dim,dtype = float)
+                # 对序列进行随机洗牌
+                shuffled_indices = torch.randperm(output_dim)
+                nn.init.zeros_(self.lora_A[adapter_name].weight)
+                # 根据洗牌后的索引获取不重复的随机整数
+                self.lora_B[adapter_name].weight = nn.Parameter(ordered_indices[shuffled_indices[0:r]])
+
             elif init_lora_weights.lower() == "gaussian":
                 nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
+            nn.init.zeros_(self.lora_A[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
             # initialize a the same way as the default for nn.linear and b to zero
             nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
-
-    def pissa_init(self, adapter_name, init_lora_weights):
-        weight = self.get_base_layer().weight
-        dtype = weight.dtype
-        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-            raise TypeError(
-                "Please initialize PiSSA under float32, float16, or bfloat16. "
-                "Subsequently, re-quantize the residual model to help minimize quantization errors."
-            )
-        weight = weight.to(torch.float32)
-
-        if init_lora_weights == "pissa":
-            # USV^T = W <-> VSU^T = W^T, where W^T = weight.data in R^{out_channel, in_channel},
-            V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
-            Vr = V[:, : self.r[adapter_name]]
-            Sr = S[: self.r[adapter_name]]
-            Sr /= self.scaling[adapter_name]
-            Uhr = Uh[: self.r[adapter_name]]
-        elif len(init_lora_weights.split("_niter_")) == 2:
-            Vr, Sr, Ur = svd_lowrank(
-                weight.data, self.r[adapter_name], niter=int(init_lora_weights.split("_niter_")[-1])
-            )
-            Sr /= self.scaling[adapter_name]
-            Uhr = Ur.t()
-        else:
-            raise ValueError(
-                f"init_lora_weights should be 'pissa' or 'pissa_niter_[number of iters]', got {init_lora_weights} instead."
-            )
-
-        lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
-        lora_B = Vr @ torch.diag(torch.sqrt(Sr))
-        self.lora_A[adapter_name].weight.data = lora_A
-        self.lora_B[adapter_name].weight.data = lora_B
-        weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
-        weight = weight.to(dtype)
-        self.get_base_layer().weight.data = weight
 
     def loftq_init(self, adapter_name):
         from peft.utils.loftq_utils import loftq_init
@@ -209,36 +215,25 @@ class LoraLayer(BaseTunerLayer):
 
     def _get_weight_norm(self, weight, lora_weight, scaling) -> torch.Tensor:
         # calculate L2 norm of weight matrix, column-wise
-        weight = transpose(weight, self.fan_in_fan_out)
         weight = weight + scaling * lora_weight
         weight_norm = torch.linalg.norm(weight, dim=1).to(weight.dtype)
         return weight_norm
 
     def dora_init(self, adapter_name: str) -> None:
-        lora_A = self.lora_A[adapter_name].weight
-        lora_B = self.lora_B[adapter_name].weight
-        # temporarily convert fp16 to fp32, as fp16 can cause trouble on CPU with PyTorch < 2.2
-        dtype_is_fp16 = lora_A.dtype == torch.float16
-        if dtype_is_fp16:
-            lora_A = lora_A.float()
-            lora_B = lora_B.float()
-
+        lora_A = self.lora_A[adapter_name]
+        lora_B = self.lora_B[adapter_name]
         scaling = self.scaling[adapter_name]
-        with gather_params_ctx(self.get_base_layer().parameters()):
-            base_layer = self.get_base_layer()
-            weight = dequantize_module_weight(base_layer)
+        with gather_params_ctx(self.get_base_layer()):
+            weight = self.get_base_layer().weight
+            quant_state = getattr(self.get_base_layer(), "state", None)
+            weight = dequantize_bnb_weight(weight, state=quant_state)  # no-op if not bnb
             if weight.data.ndim == 4:  # For handling LoRAs applied to Conv2Ds.
-                lora_weight = torch.mm(lora_B.flatten(start_dim=1), lora_A.flatten(start_dim=1))
+                lora_weight = torch.mm(lora_B.weight.flatten(start_dim=1), lora_A.weight.flatten(start_dim=1))
                 lora_weight = lora_weight.reshape(weight.shape)
             else:
-                lora_weight = lora_B @ lora_A
-
-            if dtype_is_fp16:
-                lora_weight = lora_weight.half()
+                lora_weight = lora_B.weight @ lora_A.weight
             weight_norm = self._get_weight_norm(weight, lora_weight, scaling)
-
-        if self.lora_magnitude_vector is None:
-            self.lora_magnitude_vector = nn.ParameterDict()
+        self.lora_magnitude_vector = nn.ParameterDict()
         self.lora_magnitude_vector[adapter_name] = nn.Parameter(weight_norm, requires_grad=True)
         # add lora_magnitude_vector to the list of learnable parameters
         self.adapter_layer_names = self.adapter_layer_names[:] + ("lora_magnitude_vector",)
@@ -257,8 +252,9 @@ class LoraLayer(BaseTunerLayer):
         """
         lora_weight = lora_B.weight @ lora_A.weight
         magnitude = self.lora_magnitude_vector[active_adapter]
-        base_layer = self.get_base_layer()
-        weight = dequantize_module_weight(base_layer)
+        weight = self.get_base_layer().weight
+        quant_state = getattr(self.get_base_layer(), "state", None)
+        weight = dequantize_bnb_weight(weight, state=quant_state)  # no-op if not bnb
         weight = weight.to(x.dtype)
         weight_norm = self._get_weight_norm(weight, lora_weight, scaling)
         # see section 4.3 of DoRA (https://arxiv.org/abs/2402.09353)
@@ -311,63 +307,6 @@ class LoraLayer(BaseTunerLayer):
             else:
                 self.scaling[active_adapter] /= scale
 
-    def _check_forward_args(self, x, *args, **kwargs):
-        """Check if the arguments are compatible with the configs and state of the model"""
-        adapter_names = kwargs.get("adapter_names", None)
-        if adapter_names is None:
-            return
-
-        if len(x) != len(adapter_names):
-            msg = (
-                "Length of `adapter_names` should be the same as the number of inputs, but got "
-                f"{len(adapter_names)} and {len(x)} respectively."
-            )
-            raise ValueError(msg)
-
-        if self.merged:
-            # It is unclear what would be the right thing to do if users pass adapter_names and there are merged
-            # adapters. Therefore, it is better to raise an error in this case.
-            msg = "Cannot pass `adapter_names` when there are merged adapters, please call `unmerge_adapter` first."
-            raise ValueError(msg)
-
-        unique_adapters = set(self.active_adapters)
-        for adapter_name in unique_adapters:
-            if self.use_dora.get(adapter_name, False):
-                msg = "Cannot pass `adapter_names` when DoRA is enabled."
-                raise ValueError(msg)
-
-    def _mixed_batch_forward(
-        self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
-    ) -> torch.Tensor:
-        # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
-        # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
-        torch_result_dtype = result.dtype
-
-        unique_adapters = set(adapter_names)
-        sub_batch_indices_list = []
-        for adapter in unique_adapters:
-            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
-
-        for i, active_adapter in enumerate(unique_adapters):
-            if active_adapter == "__base__":
-                continue
-            if active_adapter not in self.lora_A.keys():
-                continue
-
-            lora_A = self.lora_A[active_adapter]
-            lora_B = self.lora_B[active_adapter]
-            dropout = self.lora_dropout[active_adapter]
-            scaling = self.scaling[active_adapter]
-
-            # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
-            # layer output
-            sub_batch = x[sub_batch_indices_list[i]].to(lora_A.weight.dtype)
-            lora_output = lora_B(lora_A(dropout(sub_batch))) * scaling
-            result[sub_batch_indices_list[i]] += lora_output.to(torch_result_dtype)
-
-        return result
-
 
 # Below code is based on https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # and modified to work with PyTorch FSDP
@@ -411,7 +350,7 @@ class Linear(nn.Module, LoraLayer):
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -420,7 +359,7 @@ class Linear(nn.Module, LoraLayer):
                 If True, the merge operation will be performed in a copy of the original weights and check for NaNs
                 before merging the weights. This is useful if you want to check if the merge operation will produce
                 NaNs. Defaults to `False`.
-            adapter_names (`list[str]`, *optional*):
+            adapter_names (`List[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
@@ -433,8 +372,8 @@ class Linear(nn.Module, LoraLayer):
             if active_adapter in self.lora_A.keys():
                 base_layer = self.get_base_layer()
                 if safe_merge:
-                    # Note that safe_merge will be slower than the normal merge
-                    # because of the copy operation.
+                    #Note that safe_merge will be slower than the normal merge
+                    #because of the copy operation.
                     orig_weights = base_layer.weight.data.clone()
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
@@ -442,16 +381,13 @@ class Linear(nn.Module, LoraLayer):
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
-                        weight_norm = self._get_weight_norm(
-                            orig_weights, transpose(delta_weight, self.fan_in_fan_out), scaling=1
-                        ).detach()
+                        weight_norm = self._get_weight_norm(orig_weights, delta_weight, scaling=1).detach()
                         # We need to cache weight_norm because it has to be based on the original weights. We
                         # cannot calculate it on the fly based on the merged weights when unmerging because its a
                         # different value
                         self._cache_store(f"{active_adapter}-weight_norm", weight_norm)
                         dora_factor = self.lora_magnitude_vector[active_adapter] / weight_norm
-                        dora_factor = transpose(dora_factor.view(-1, 1), self.fan_in_fan_out)
-                        orig_weights = dora_factor * (orig_weights + delta_weight)
+                        orig_weights = dora_factor.view(-1, 1) * (orig_weights + delta_weight)
 
                     if not torch.isfinite(orig_weights).all():
                         raise ValueError(
@@ -459,6 +395,8 @@ class Linear(nn.Module, LoraLayer):
                         )
 
                     base_layer.weight.data = orig_weights
+            
+
                 else:
                     delta_weight = self.get_delta_weight(active_adapter)
                     if not self.use_dora[active_adapter]:
@@ -466,16 +404,13 @@ class Linear(nn.Module, LoraLayer):
                     else:
                         # handle dora
                         # since delta_weight already includes scaling, set it to 1 here
-                        weight_norm = self._get_weight_norm(
-                            base_layer.weight, transpose(delta_weight, self.fan_in_fan_out), scaling=1
-                        ).detach()
+                        weight_norm = self._get_weight_norm(base_layer.weight, delta_weight, scaling=1).detach()
                         # We need to cache weight_norm because it has to be based on the original weights. We
                         # cannot calculate it on the fly based on the merged weights when unmerging because its a
                         # different value
                         self._cache_store(f"{active_adapter}-weight_norm", weight_norm)
                         dora_factor = self.lora_magnitude_vector[active_adapter] / weight_norm
-                        dora_factor = transpose(dora_factor.view(-1, 1), self.fan_in_fan_out)
-                        new_weight = dora_factor * (base_layer.weight.data + delta_weight)
+                        new_weight = dora_factor.view(-1, 1) * (base_layer.weight.data + delta_weight)
                         base_layer.weight.data = new_weight
 
                 self.merged_adapters.append(active_adapter)
@@ -531,24 +466,48 @@ class Linear(nn.Module, LoraLayer):
             # cast back the weights
             self.lora_A[adapter].weight.data = weight_A.to(dtype)
             self.lora_B[adapter].weight.data = weight_B.to(dtype)
-
         return output_tensor
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
+        ####### my modified #########
+        # cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
 
+        # weight_A = self.lora_A[adapter].weight
+        # #weight_A = self.lora_A[adapter]
+        # weight_B = self.lora_B[adapter].weight
+
+        # if cast_to_fp32:
+        #     weight_A = weight_A.float()
+        #     weight_B = weight_B.float()
+
+        # #output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+        # output_tensor = nn.Parameter(torch.zeros())
+        # base_layer = self.get_base_layer()
+        # dim, output_dim = base_layer.weight.T.shape
+        # output_tensor = output_tensor.index_add_(0,weight_A.int(),weight_B.T)
+        # if cast_to_fp32:
+        #     output_tensor = output_tensor.to(dtype=dtype)
+
+        #     # cast back the weights
+        #     self.lora_A[adapter].weight.data = weight_A.to(dtype)
+        #     self.lora_B[adapter].weight.data = weight_B.to(dtype)
+
+        # return output_tensor
+
+
+#修改新的前传函数
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+      #merged表示是否合并了这个状态,lora_A包含了所有使用LoraA的层次
         if self.disable_adapters:
+          #若是不使用微调器
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
+        #训练时最常用的方式，分开训练
         else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
+            #result = self.base_layer(x, *args, **kwargs)
+            #torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
@@ -559,13 +518,37 @@ class Linear(nn.Module, LoraLayer):
                 x = x.to(lora_A.weight.dtype)
 
                 if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    # 原有前传方式
+                    # result = self.base_layer(x, *args, **kwargs) + lora_B(lora_A(dropout(x))) * scaling
+                    
+
+                    # # 采样方式
+                    # result = self.base_layer(x, *args, **kwargs) + lora_B(dropout(x[: , : , lora_A.weight.data.int()])) * scaling
+                      
+                    # #index adding
+                    # bias = None
+                    # # # #originweight = self.base_layer.weight.data.to(x.dtype)
+                    # # #index = lora_A.weight.data.detach().int()
+                    # #self.base_layer.weight.requires_grad = False
+                    # mergedweight = self.base_layer.weight.data.index_add_(1,lora_A.weight.data.int(),lora_B.weight*scaling)
+                    # result = torch.nn.functional.linear(x, mergedweight,bias).to(x.dtype)
+
+
+                    # SBLora-B
+                    result = self.base_layer(x, *args, **kwargs)
+                    batch, seq, output= result.size()
+                    zero_tensor = torch.zeros(batch,seq,output,dtype = result.dtype).cuda()
+                    zero_tensor[:,:,lora_B.weight.data.int()] = lora_A(dropout(x))*scaling
+                    result = self.base_layer(x, *args, **kwargs).index_add_(2,lora_B.weight.data.int(),lora_A(dropout(x))*scaling)
+                    return result+zero_tensor
                 else:
+                    result = self.base_layer(x, *args, **kwargs)
+                    torch_result_dtype = result.dtype
                     x = dropout(x)
                     result = result + self._apply_dora(x, lora_A, lora_B, scaling, active_adapter)
 
-            result = result.to(torch_result_dtype)
-
+      
+            #result = result.to(torch_result_dtype)
         return result
 
     def __repr__(self) -> str:
@@ -631,10 +614,15 @@ class Embedding(nn.Module, LoraLayer):
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        self._move_adapter_to_device_of_base_layer(adapter_name)
+        base_layer = self.get_base_layer()
+        weight = getattr(base_layer, "weight", None)
+        if weight is not None:
+            # the layer is already completely initialized, this is an update
+            self.to(base_layer.weight.device, dtype=weight.dtype)
+
         self.set_adapter(self.active_adapters)
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -643,7 +631,7 @@ class Embedding(nn.Module, LoraLayer):
                 If True, the merge operation will be performed in a copy of the original weights and check for NaNs
                 before merging the weights. This is useful if you want to check if the merge operation will produce
                 NaNs. Defaults to `False`.
-            adapter_names (`list[str]`, *optional*):
+            adapter_names (`List[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
@@ -717,36 +705,6 @@ class Embedding(nn.Module, LoraLayer):
 
         return output_tensor
 
-    def _mixed_batch_forward(
-        self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
-    ) -> torch.Tensor:
-        # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
-        # extra argument that allows mixing different adapters in the same batch at inference time.
-        result = self.base_layer(x, *args, **kwargs)
-
-        unique_adapters = set(adapter_names)
-        sub_batch_indices_list = []
-        for adapter in unique_adapters:
-            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
-
-        for i, active_adapter in enumerate(unique_adapters):
-            if active_adapter == "__base__":
-                continue
-            if active_adapter not in self.lora_embedding_A.keys():
-                continue
-
-            embedding_A = self.lora_embedding_A[active_adapter].T
-            embedding_B = self.lora_embedding_B[active_adapter].T
-            scaling = self.scaling[active_adapter]
-
-            # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
-            # layer output
-            sub_batch = x[sub_batch_indices_list[i]]
-            after_A = self._embed(sub_batch, embedding_A)
-            result[sub_batch_indices_list[i]] += (after_A @ embedding_B) * scaling
-
-        return result
-
     def _embed(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         base_layer = self.get_base_layer()
         return F.embedding(
@@ -761,15 +719,10 @@ class Embedding(nn.Module, LoraLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         # TODO: no dtype conversion here, unlike in Linear, is that correct?
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
-
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
@@ -849,8 +802,10 @@ class Conv2d(nn.Module, LoraLayer):
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        # call this before dora_init
-        self._move_adapter_to_device_of_base_layer(adapter_name)
+        weight = getattr(base_layer, "weight", None)
+        if weight is not None:
+            # the layer is already completely initialized, this is an update
+            self.to(base_layer.weight.device, dtype=weight.dtype)
 
         if use_dora:
             self.dora_init(adapter_name)
@@ -860,7 +815,7 @@ class Conv2d(nn.Module, LoraLayer):
 
         self.set_adapter(self.active_adapters)
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
         """
         Merge the active adapter weights inside the base weights
 
@@ -869,7 +824,7 @@ class Conv2d(nn.Module, LoraLayer):
                 If True, the merge operation will be performed in a copy of the original weights and check for NaNs
                 before merging the weights. This is useful if you want to check if the merge operation will produce
                 NaNs. Defaults to `False`.
-            adapter_names (`list[str]`, *optional*):
+            adapter_names (`List[str]`, *optional*):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
@@ -1032,15 +987,10 @@ class Conv2d(nn.Module, LoraLayer):
         return result_dora
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
-
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
-        elif adapter_names is not None:
-            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
